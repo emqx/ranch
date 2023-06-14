@@ -59,7 +59,8 @@ groups() ->
 		ssl_getstat_capability,
 		ssl_error_eaddrinuse,
 		ssl_error_no_cert,
-		ssl_error_eacces
+		ssl_error_eacces,
+		ssl_unsupported_tlsv13_options
 	]}, {misc, [
 		misc_bad_transport,
 		misc_bad_transport_options,
@@ -419,6 +420,36 @@ ssl_active_echo(_) ->
 	{'EXIT', _} = begin catch ranch:get_port(Name) end,
 	ok.
 
+ssl_active_n_echo(_) ->
+	case do_get_ssl_version() >= {9, 2, 0} of
+		true ->
+			do_ssl_active_n_echo();
+		false ->
+			{skip, "No Active N support."}
+	end.
+
+do_ssl_active_n_echo() ->
+	doc("Ensure that active N mode works with SSL transport."),
+	Name = name(),
+	Opts = ct_helper:get_certs_from_ets(),
+	{ok, _} = ranch:start_listener(Name,
+		ranch_ssl, Opts,
+		batch_echo_protocol, [{batch_size, 3}]),
+	Port = ranch:get_port(Name),
+	{ok, Socket} = ssl:connect("localhost", Port, [binary, {active, false}, {packet, raw}]),
+	ok = ssl:send(Socket, <<"One">>),
+	{ok, <<"OK">>} = ssl:recv(Socket, 2, 1000),
+	ok = ssl:send(Socket, <<"Two">>),
+	{ok, <<"OK">>} = ssl:recv(Socket, 2, 1000),
+	ok = ssl:send(Socket, <<"Three">>),
+	{ok, <<"OK">>} = ssl:recv(Socket, 2, 1000),
+	{ok, <<"OneTwoThree">>} = ssl:recv(Socket, 11, 1000),
+	ok = ranch:stop_listener(Name),
+	{error, closed} = ssl:recv(Socket, 0, 1000),
+	%% Make sure the listener stopped.
+	{'EXIT', _} = begin catch ranch:get_port(Name) end,
+	ok.
+
 ssl_echo(_) ->
 	doc("Ensure that passive mode works with SSL transport."),
 	Name = name(),
@@ -614,6 +645,46 @@ ssl_error_eacces(_) ->
 				active_echo_protocol, []),
 			ok
 	end.
+
+ssl_unsupported_tlsv13_options(_) ->
+	{available, Versions} = lists:keyfind(available, 1, ssl:versions()),
+	case {lists:member('tlsv1.3', Versions), do_get_ssl_version() >= {10, 0, 0}} of
+		{true, true} ->
+			do_ssl_unsupported_tlsv13_options();
+		{false, _} ->
+			{skip, "No TLSv1.3 support."};
+		{_, false} ->
+			{skip, "No TLSv1.3 option dependency checking."}
+	end.
+
+do_ssl_unsupported_tlsv13_options() ->
+	doc("Ensure that a listener can be started when TLSv1.3 is "
+	    "the only protocol and unsupported options are present."),
+	CheckOpts = [
+		{beast_mitigation, one_n_minus_one},
+		{client_renegotiation, true},
+		{next_protocols_advertised, [<<"dummy">>]},
+		{padding_check, true},
+		{psk_identity, "dummy"},
+		{secure_renegotiate, true},
+		{reuse_session, fun (_, _, _, _) -> true end},
+		{reuse_sessions, true},
+		{user_lookup_fun, {fun (_, _, _) -> error end, <<"dummy">>}}
+	],
+	Name = name(),
+	Opts = ct_helper:get_certs_from_ets() ++ [{versions, ['tlsv1.3']}],
+	ok = lists:foreach(
+		fun (CheckOpt) ->
+			Opts1 = Opts ++ [CheckOpt],
+			{error, {options, dependency, _}} = ssl:listen(0, Opts1),
+			{ok, _} = ranch:start_listener(Name,
+				ranch_ssl, #{socket_opts => Opts1},
+				echo_protocol, []),
+			ok = ranch:stop_listener(Name)
+		end,
+		CheckOpts
+	),
+	ok.
 
 %% tcp.
 
@@ -1197,3 +1268,52 @@ do_get_listener_socket(ListenerSupPid) ->
 	{links, Links} = erlang:process_info(AcceptorsSupPid, links),
 	[LSocket] = [P || P <- Links, is_port(P)],
 	LSocket.
+
+do_conns_which_children(Name) ->
+	Conns = [supervisor:which_children(ConnsSup) ||
+		{_, ConnsSup} <- ranch_server:get_connections_sups(Name)],
+	lists:flatten(Conns).
+
+do_conns_count_children(Name) ->
+	lists:foldl(
+		fun
+			(Stats, undefined) ->
+				Stats;
+			(Stats, Acc) ->
+				lists:zipwith(
+					fun ({K, V1}, {K, V2}) -> {K, V1+V2} end,
+					Acc,
+					Stats
+				)
+		end,
+		undefined,
+		[supervisor:count_children(ConnsSup) ||
+			{_, ConnsSup} <- ranch_server:get_connections_sups(Name)]
+	).
+
+do_os_supports_reuseport() ->
+	case {os:type(), os:version()} of
+		{{unix, linux}, {Major, _, _}} when Major > 3 -> true;
+		{{unix, linux}, {3, Minor, _}} when Minor >= 9 -> true;
+		_ -> false
+	end.
+
+do_os_supports_local_sockets() ->
+	case os:type() of
+		{unix, _} -> true;
+		_ -> false
+	end.
+
+do_tempname() ->
+	list_to_binary(lists:droplast(os:cmd("mktemp -u"))).
+
+do_get_ssl_version() ->
+	{ok, Vsn} = application:get_key(ssl, vsn),
+	Vsns0 = re:split(Vsn, "\\D+", [{return, list}]),
+	Vsns1 = lists:map(fun list_to_integer/1, Vsns0),
+	case Vsns1 of
+		[] -> {0, 0, 0};
+		[Major] -> {Major, 0, 0};
+		[Major, Minor] -> {Major, Minor, 0};
+		[Major, Minor, Patch|_] -> {Major, Minor, Patch}
+	end.
