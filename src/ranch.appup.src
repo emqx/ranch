@@ -1,0 +1,5 @@
+{"1.8.1",
+  [{"1.8.0", [{load_module, ranch_ssl, brutal_purge, soft_purge, []}]},
+   {<<".*">>,[{restart_application, ranch}]}],
+  [{"1.8.0", [{load_module, ranch_ssl, brutal_purge, soft_purge, []}]},
+   {<<".*">>,[{restart_application, ranch}]}]}.
