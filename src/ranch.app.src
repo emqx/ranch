@@ -1,6 +1,6 @@
 {application, ranch, [
 	{description, "Socket acceptor pool for TCP protocols."},
-	{vsn, "1.8.1"},
+	{vsn, "1.8.1-emqx-1"},
 	{modules, []},
 	{registered, [ranch_sup,ranch_server]},
 	{applications, [kernel,stdlib,ssl]},
