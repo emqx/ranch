@@ -7,12 +7,13 @@ jobs:
     runs-on: ubuntu-latest
 
     container:
-      image: erlang:25
+      image: erlang:27
+
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - run: make
       - run: make ct
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: logs
