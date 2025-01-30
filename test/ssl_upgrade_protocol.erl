@@ -17,7 +17,7 @@ loop(Socket, Transport) ->
 		{ok, <<"UPGRADE">>} when Transport =:= ranch_tcp ->
 			ok = Transport:send(Socket, <<"READY">>),
 			Opts = ct_helper:get_certs_from_ets(),
-			{ok, NewSocket} = ranch_ssl:handshake(Socket, [{verify, verify_none}|Opts], 1000),
+			{ok, NewSocket} = ranch_ssl:handshake(Socket, Opts ++ [{verify, verify_none}], 1000),
 			loop(NewSocket, ranch_ssl);
 		{ok, <<"ECHO ", More/binary>>} ->
 			ok = Transport:send(Socket, More),
