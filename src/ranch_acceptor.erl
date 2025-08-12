@@ -31,8 +31,8 @@ init(LSocket, Transport, Logger, ConnsSup) ->
 	loop(LSocket, Transport, Logger, ConnsSup, MonitorRef).
 
 -spec loop(inet:socket(), module(), module(), pid(), reference()) -> no_return().
-loop(LSocket, Transport, Logger, ConnsSup, MonitorRef) ->
-	_ = case Transport:accept(LSocket, infinity) of
+loop(LSocket0, Transport, Logger, ConnsSup, MonitorRef) ->
+	Ret = case accept(LSocket0, Transport, infinity) of
 		{ok, CSocket} ->
 			case Transport:controlling_process(CSocket, ConnsSup) of
 				ok ->
@@ -50,16 +50,49 @@ loop(LSocket, Transport, Logger, ConnsSup, MonitorRef) ->
 			ranch:log(warning,
 				"Ranch acceptor reducing accept rate: out of file descriptors~n",
 				[], Logger),
-			receive after 100 -> ok end;
+			receive after 100 -> loop end;
 		%% Exit if the listening socket got closed.
 		{error, closed} ->
 			exit(closed);
 		%% Continue otherwise.
 		{error, _} ->
-			ok
+			loop
+	end,
+	LSocket = case Ret of
+		%% Accept succeeded and connection process started.
+		ok -> depenalize(LSocket0);
+		%% Accept succeeded but connsup returned penalty.
+		{penalty, Penalty} -> penalize(Penalty, LSocket0);
+		%% Otherwise, accept errors or active penalty.
+		loop -> LSocket0
 	end,
 	flush(Logger),
 	?MODULE:loop(LSocket, Transport, Logger, ConnsSup, MonitorRef).
+
+accept({close_until, Deadline, LSocket}, Transport, Timeout) ->
+	case Transport:accept(LSocket, Timeout) of
+		{ok, CSocket} ->
+			case erlang:monotonic_time(millisecond) of
+				T when T < Deadline ->
+					Transport:close(CSocket),
+					{error, penalty};
+				_ ->
+					{ok, CSocket}
+			end;
+		Error ->
+			Error
+	end;
+accept(LSocket, Transport, Timeout) ->
+	Transport:accept(LSocket, Timeout).
+
+penalize({close_connections_for, Milliseconds}, LSocket) ->
+	Deadline = erlang:monotonic_time(millisecond) + Milliseconds,
+	{close_until, Deadline, LSocket}.
+
+depenalize({close_until, _, LSocket}) ->
+	LSocket;
+depenalize(LSocket) ->
+	LSocket.
 
 flush(Logger) ->
 	receive Msg ->
