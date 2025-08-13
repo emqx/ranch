@@ -43,6 +43,7 @@
 	opts :: any(),
 	handshake_timeout :: timeout(),
 	max_conns = undefined :: ranch:max_conns(),
+	limiter_opts = undefined :: {module(), _Options} | undefined,
 	stats_counters_ref :: counters:counters_ref(),
 	alarms = #{} :: #{term() => {map(), undefined | reference()}},
 	logger = undefined :: module()
@@ -77,6 +78,8 @@ start_protocol(SupPid, MonitorRef, Socket) ->
 	receive
 		SupPid ->
 			ok;
+		{SupPid, Reply} ->
+			Reply;
 		{'DOWN', MonitorRef, process, SupPid, Reason} ->
 			error(Reason)
 	end.
@@ -112,6 +115,8 @@ init(Parent, Ref, Id, Transport, TransOpts, Protocol, Logger) ->
 	ConnType = maps:get(connection_type, TransOpts, worker),
 	Shutdown = maps:get(shutdown, TransOpts, 5000),
 	HandshakeTimeout = maps:get(handshake_timeout, TransOpts, 5000),
+	LimiterOpts = maps:get(limiter, TransOpts, undefined),
+	Limiter = limiter_init(LimiterOpts),
 	ProtoOpts = ranch_server:get_protocol_options(Ref),
 	StatsCounters = ranch_server:get_stats_counters(Ref),
 	ok = proc_lib:init_ack(Parent, {ok, self()}),
@@ -120,20 +125,30 @@ init(Parent, Ref, Id, Transport, TransOpts, Protocol, Logger) ->
 		opts=ProtoOpts, stats_counters_ref=StatsCounters,
 		handshake_timeout=HandshakeTimeout,
 		max_conns=MaxConns, alarms=Alarms,
-		logger=Logger}, 0, 0, []).
+		limiter_opts=LimiterOpts,
+		logger=Logger}, 0, 0, Limiter, []).
 
 loop(State=#state{parent=Parent, ref=Ref, id=Id, conn_type=ConnType,
 		transport=Transport, protocol=Protocol, opts=Opts, stats_counters_ref=StatsCounters,
-		alarms=Alarms, max_conns=MaxConns, logger=Logger}, CurConns, NbChildren, Sleepers) ->
+		alarms=Alarms, max_conns=MaxConns, logger=Logger},
+		CurConns, NbChildren, Limiter, Sleepers) ->
 	receive
 		{?MODULE, start_protocol, To, Socket} ->
-			try Protocol:start_link(Ref, Transport, Opts) of
+			{LimitRet, Limiter1} = limiter_allow(Socket, Limiter),
+			try LimitRet == ok andalso Protocol:start_link(Ref, Transport, Opts) of
 				{ok, Pid} ->
 					inc_accept(StatsCounters, Id, 1),
-					handshake(State, CurConns, NbChildren, Sleepers, To, Socket, Pid, Pid);
+					Limiter2 = limiter_accepted(Pid, Limiter1),
+					handshake(State, CurConns, NbChildren, Limiter2, Sleepers,
+						To, Socket, Pid, Pid);
 				{ok, SupPid, ProtocolPid} when ConnType =:= supervisor ->
 					inc_accept(StatsCounters, Id, 1),
-					handshake(State, CurConns, NbChildren, Sleepers, To, Socket, SupPid, ProtocolPid);
+					Limiter2 = limiter_accepted(SupPid, Limiter1),
+					handshake(State, CurConns, NbChildren, Limiter2, Sleepers,
+						To, Socket, SupPid, ProtocolPid);
+				false ->
+					penalize(State, LimitRet, Socket, To),
+					loop(State, CurConns, NbChildren, Limiter1, Sleepers);
 				Ret ->
 					To ! self(),
 					ranch:log(error,
@@ -141,7 +156,7 @@ loop(State=#state{parent=Parent, ref=Ref, id=Id, conn_type=ConnType,
 						"~p:start_link/3 returned: ~0p~n",
 						[Ref, Protocol, Ret], Logger),
 					Transport:close(Socket),
-					loop(State, CurConns, NbChildren, Sleepers)
+					loop(State, CurConns, NbChildren, Limiter1, Sleepers)
 			catch Class:Reason ->
 				To ! self(),
 				ranch:log(error,
@@ -149,48 +164,49 @@ loop(State=#state{parent=Parent, ref=Ref, id=Id, conn_type=ConnType,
 					"~p:start_link/3 crashed with reason: ~p:~0p~n",
 					[Ref, Protocol, Class, Reason], Logger),
 				Transport:close(Socket),
-				loop(State, CurConns, NbChildren, Sleepers)
+				loop(State, CurConns, NbChildren, Limiter1, Sleepers)
 			end;
 		{?MODULE, active_connections, To, Tag} ->
 			To ! {Tag, CurConns},
-			loop(State, CurConns, NbChildren, Sleepers);
+			loop(State, CurConns, NbChildren, Limiter, Sleepers);
 		%% Remove a connection from the count of connections.
 		{remove_connection, Ref, Pid} ->
 			case put(Pid, removed) of
 				active when Sleepers =:= [] ->
-					loop(State, CurConns - 1, NbChildren, Sleepers);
+					loop(State, CurConns - 1, NbChildren, Limiter, Sleepers);
 				active ->
 					[To|Sleepers2] = Sleepers,
 					To ! self(),
-					loop(State, CurConns - 1, NbChildren, Sleepers2);
+					loop(State, CurConns - 1, NbChildren, Limiter, Sleepers2);
 				removed ->
-					loop(State, CurConns, NbChildren, Sleepers);
+					loop(State, CurConns, NbChildren, Limiter, Sleepers);
 				undefined ->
 					_ = erase(Pid),
-					loop(State, CurConns, NbChildren, Sleepers)
+					loop(State, CurConns, NbChildren, Limiter, Sleepers)
 			end;
 		%% Upgrade the max number of connections allowed concurrently.
 		%% We resume all sleeping acceptors if this number increases.
 		{set_max_conns, MaxConns2} when MaxConns2 > MaxConns ->
 			_ = [To ! self() || To <- Sleepers],
 			loop(State#state{max_conns=MaxConns2},
-				CurConns, NbChildren, []);
+				CurConns, NbChildren, Limiter, []);
 		{set_max_conns, MaxConns2} ->
 			loop(State#state{max_conns=MaxConns2},
-				CurConns, NbChildren, Sleepers);
+				CurConns, NbChildren, Limiter, Sleepers);
 		%% Upgrade the transport options.
 		{set_transport_options, TransOpts} ->
-			set_transport_options(State, CurConns, NbChildren, Sleepers, TransOpts);
+			set_transport_options(State, CurConns, NbChildren, Limiter, Sleepers, TransOpts);
 		%% Upgrade the protocol options.
 		{set_protocol_options, Opts2} ->
 			loop(State#state{opts=Opts2},
-				CurConns, NbChildren, Sleepers);
+				CurConns, NbChildren, Limiter, Sleepers);
 		{timeout, _, {activate_alarm, AlarmName}} when is_map_key(AlarmName, Alarms) ->
 			{AlarmOpts, _} = maps:get(AlarmName, Alarms),
 			NewAlarm = trigger_alarm(Ref, AlarmName, {AlarmOpts, undefined}, CurConns),
-			loop(State#state{alarms=Alarms#{AlarmName => NewAlarm}}, CurConns, NbChildren, Sleepers);
+			loop(State#state{alarms=Alarms#{AlarmName => NewAlarm}},
+				CurConns, NbChildren, Limiter, Sleepers);
 		{timeout, _, {activate_alarm, _}} ->
-			loop(State, CurConns, NbChildren, Sleepers);
+			loop(State, CurConns, NbChildren, Limiter, Sleepers);
 		{'EXIT', Parent, Reason} ->
 			terminate(State, Reason, NbChildren);
 		{'EXIT', Pid, Reason} when Sleepers =:= [] ->
@@ -198,13 +214,15 @@ loop(State=#state{parent=Parent, ref=Ref, id=Id, conn_type=ConnType,
 				active ->
 					inc_terminate(StatsCounters, Id, 1),
 					report_error(Logger, Ref, Protocol, Pid, Reason),
-					loop(State, CurConns - 1, NbChildren - 1, Sleepers);
+					Limiter1 = limiter_retired(Pid, Limiter),
+					loop(State, CurConns - 1, NbChildren - 1, Limiter1, Sleepers);
 				removed ->
 					inc_terminate(StatsCounters, Id, 1),
 					report_error(Logger, Ref, Protocol, Pid, Reason),
-					loop(State, CurConns, NbChildren - 1, Sleepers);
+					Limiter1 = limiter_retired(Pid, Limiter),
+					loop(State, CurConns, NbChildren - 1, Limiter1, Sleepers);
 				undefined ->
-					loop(State, CurConns, NbChildren, Sleepers)
+					loop(State, CurConns, NbChildren, Limiter, Sleepers)
 			end;
 		%% Resume a sleeping acceptor if needed.
 		{'EXIT', Pid, Reason} ->
@@ -212,30 +230,33 @@ loop(State=#state{parent=Parent, ref=Ref, id=Id, conn_type=ConnType,
 				active when CurConns > MaxConns ->
 					inc_terminate(StatsCounters, Id, 1),
 					report_error(Logger, Ref, Protocol, Pid, Reason),
-					loop(State, CurConns - 1, NbChildren - 1, Sleepers);
+					Limiter1 = limiter_retired(Pid, Limiter),
+					loop(State, CurConns - 1, NbChildren - 1, Limiter1, Sleepers);
 				active ->
 					inc_terminate(StatsCounters, Id, 1),
 					report_error(Logger, Ref, Protocol, Pid, Reason),
 					[To|Sleepers2] = Sleepers,
 					To ! self(),
-					loop(State, CurConns - 1, NbChildren - 1, Sleepers2);
+					Limiter1 = limiter_retired(Pid, Limiter),
+					loop(State, CurConns - 1, NbChildren - 1, Limiter1, Sleepers2);
 				removed ->
 					inc_terminate(StatsCounters, Id, 1),
 					report_error(Logger, Ref, Protocol, Pid, Reason),
-					loop(State, CurConns, NbChildren - 1, Sleepers);
+					Limiter1 = limiter_retired(Pid, Limiter),
+					loop(State, CurConns, NbChildren - 1, Limiter1, Sleepers);
 				undefined ->
-					loop(State, CurConns, NbChildren, Sleepers)
+					loop(State, CurConns, NbChildren, Limiter, Sleepers)
 			end;
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Parent, ?MODULE, [],
-				{State, CurConns, NbChildren, Sleepers});
+				{State, CurConns, NbChildren, Limiter, Sleepers});
 		%% Calls from the supervisor module.
 		{'$gen_call', {To, Tag}, which_children} ->
 			Children = [{Protocol, Pid, ConnType, [Protocol]}
 				|| {Pid, Type} <- get(),
 				Type =:= active orelse Type =:= removed],
 			To ! {Tag, Children},
-			loop(State, CurConns, NbChildren, Sleepers);
+			loop(State, CurConns, NbChildren, Limiter, Sleepers);
 		{'$gen_call', {To, Tag}, count_children} ->
 			Counts = case ConnType of
 				worker -> [{supervisors, 0}, {workers, NbChildren}];
@@ -243,19 +264,20 @@ loop(State=#state{parent=Parent, ref=Ref, id=Id, conn_type=ConnType,
 			end,
 			Counts2 = [{specs, 1}, {active, NbChildren}|Counts],
 			To ! {Tag, Counts2},
-			loop(State, CurConns, NbChildren, Sleepers);
+			loop(State, CurConns, NbChildren, Limiter, Sleepers);
 		{'$gen_call', {To, Tag}, _} ->
 			To ! {Tag, {error, ?MODULE}},
-			loop(State, CurConns, NbChildren, Sleepers);
+			loop(State, CurConns, NbChildren, Limiter, Sleepers);
 		Msg ->
 			ranch:log(error,
 				"Ranch listener ~p received unexpected message ~p~n",
 				[Ref, Msg], Logger),
-			loop(State, CurConns, NbChildren, Sleepers)
+			loop(State, CurConns, NbChildren, Limiter, Sleepers)
 	end.
 
 handshake(State=#state{ref=Ref, transport=Transport, handshake_timeout=HandshakeTimeout,
-		max_conns=MaxConns, alarms=Alarms0}, CurConns, NbChildren, Sleepers, To, Socket, SupPid, ProtocolPid) ->
+		max_conns=MaxConns, alarms=Alarms0}, CurConns, NbChildren, Limiter, Sleepers,
+		To, Socket, SupPid, ProtocolPid) ->
 	case Transport:controlling_process(Socket, ProtocolPid) of
 		ok ->
 			ProtocolPid ! {handshake, Ref, Transport, Socket, HandshakeTimeout},
@@ -268,15 +290,55 @@ handshake(State=#state{ref=Ref, transport=Transport, handshake_timeout=Handshake
 					[To|Sleepers]
 			end,
 			Alarms1 = trigger_alarms(Ref, Alarms0, CurConns2),
-			loop(State#state{alarms=Alarms1}, CurConns2, NbChildren + 1, Sleepers2);
+			loop(State#state{alarms=Alarms1}, CurConns2, NbChildren + 1, Limiter, Sleepers2);
 		{error, _} ->
 			Transport:close(Socket),
 			%% Only kill the supervised pid, because the connection's pid,
 			%% when different, is supposed to be sitting under it and linked.
 			exit(SupPid, kill),
 			To ! self(),
-			loop(State, CurConns, NbChildren, Sleepers)
+			loop(State, CurConns, NbChildren, Limiter, Sleepers)
 	end.
+
+limiter_init(undefined) ->
+	undefined;
+limiter_init({Module, Options}) ->
+	ranch_conns_limiter:create(Module, Options).
+
+limiter_reinit(undefined) ->
+	undefined;
+limiter_reinit(ModOpts) ->
+	Limiter = limiter_init(ModOpts),
+	lists:foldl(
+		fun ({Pid, Type}, LimiterAcc) when Type =:= active orelse Type =:= removed ->
+				limiter_accepted(Pid, LimiterAcc);
+			(_, LimiterAcc) ->
+				LimiterAcc
+		end,
+		Limiter,
+		erlang:get()).
+
+limiter_allow(_Socket, undefined) ->
+	{ok, undefined};
+limiter_allow(Socket, Limiter) ->
+	ranch_conns_limiter:allow(Socket, Limiter).
+
+limiter_accepted(_Pid, undefined) ->
+	undefined;
+limiter_accepted(Pid, Limiter) ->
+	ranch_conns_limiter:accepted(Pid, Limiter).
+
+limiter_retired(_Pid, undefined) ->
+	undefined;
+limiter_retired(Pid, Limiter) ->
+	ranch_conns_limiter:retired(Pid, Limiter).
+
+penalize(#state{transport=Transport}, close_connection, Socket, To) ->
+	Transport:close(Socket),
+	To ! self();
+penalize(#state{transport=Transport}, Penalty, Socket, To) ->
+	Transport:close(Socket),
+	To ! {self(), {penalty, Penalty}}.
 
 trigger_alarms(Ref, Alarms, CurConns) ->
 	maps:map(
@@ -321,10 +383,18 @@ get_alarms(#{alarms := Alarms}) when is_map(Alarms) ->
 get_alarms(_) ->
 	#{}.
 
-set_transport_options(State=#state{max_conns=MaxConns0}, CurConns, NbChildren, Sleepers0, TransOpts) ->
+set_transport_options(State=#state{max_conns=MaxConns0, limiter_opts=LimiterOpts0},
+		CurConns, NbChildren, Limiter, Sleepers0, TransOpts) ->
 	MaxConns1 = maps:get(max_connections, TransOpts, 1024),
 	HandshakeTimeout = maps:get(handshake_timeout, TransOpts, 5000),
 	Shutdown = maps:get(shutdown, TransOpts, 5000),
+	Limiter1 = case maps:get(limiter, TransOpts, undefined) of
+			LimiterOpts0 ->
+				Limiter;
+			LimiterOpts ->
+				%% Limiter needs to be re-initialized.
+				limiter_reinit(LimiterOpts)
+		end,
 	Sleepers1 = case MaxConns1 > MaxConns0 of
 		true ->
 			_ = [To ! self() || To <- Sleepers0],
@@ -334,7 +404,7 @@ set_transport_options(State=#state{max_conns=MaxConns0}, CurConns, NbChildren, S
 	end,
 	State1=set_alarm_option(State, TransOpts, CurConns),
 	loop(State1#state{max_conns=MaxConns1, handshake_timeout=HandshakeTimeout, shutdown=Shutdown},
-		CurConns, NbChildren, Sleepers1).
+		CurConns, NbChildren, Limiter1, Sleepers1).
 
 set_alarm_option(State=#state{ref=Ref, alarms=OldAlarms}, TransOpts, CurConns) ->
 	NewAlarms0 = get_alarms(TransOpts),
@@ -464,14 +534,16 @@ wait_children(NbChildren) ->
 	end.
 
 -spec system_continue(_, _, any()) -> no_return().
-system_continue(_, _, {State, CurConns, NbChildren, Sleepers}) ->
-	loop(State, CurConns, NbChildren, Sleepers).
+system_continue(_, _, {State, CurConns, NbChildren, Limiter, Sleepers}) ->
+	loop(State, CurConns, NbChildren, Limiter, Sleepers).
 
 -spec system_terminate(any(), _, _, _) -> no_return().
-system_terminate(Reason, _, _, {State, _, NbChildren, _}) ->
+system_terminate(Reason, _, _, {State, _, NbChildren, _, _}) ->
 	terminate(State, Reason, NbChildren).
 
 -spec system_code_change(any(), _, _, _) -> {ok, any()}.
+system_code_change({State, CurConns, NbChildren, Sleepers}, _, _, _) ->
+	{ok, {State, CurConns, NbChildren, undefined, Sleepers}};
 system_code_change(Misc, _, _, _) ->
 	{ok, Misc}.
 

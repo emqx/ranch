@@ -137,6 +137,10 @@ validate_transport_opt(max_connections, infinity, _) ->
 	true;
 validate_transport_opt(max_connections, Value, _) ->
 	is_integer(Value) andalso Value >= 0;
+validate_transport_opt(limiter, {Module, _}, _) ->
+	is_atom(Module);
+validate_transport_opt(limiter, _, _) ->
+	false;
 validate_transport_opt(alarms, Alarms, _) ->
 	Alarms1 = compat_normalize_alarms_option(Alarms),
 	maps:fold(
