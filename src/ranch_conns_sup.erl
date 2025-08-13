@@ -519,6 +519,8 @@ system_terminate(Reason, _, _, {State, _, NbChildren, _, _}) ->
 	terminate(State, Reason, NbChildren).
 
 -spec system_code_change(any(), _, _, _) -> {ok, any()}.
+system_code_change({State, CurConns, NbChildren, Sleepers}, _, _, _) ->
+	{ok, {State, CurConns, NbChildren, undefined, Sleepers}};
 system_code_change(Misc, _, _, _) ->
 	{ok, Misc}.
 
