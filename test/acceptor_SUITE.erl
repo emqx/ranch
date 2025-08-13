@@ -45,6 +45,7 @@ groups() ->
 		tcp_remove_connections,
 		tcp_remove_connections_acceptor_wakeup,
 		tcp_limiter_penalty,
+		tcp_limiter_set_transport_options,
 		tcp_set_max_connections,
 		tcp_set_max_connections_clean,
 		tcp_getopts_capability,
@@ -66,6 +67,7 @@ groups() ->
 		tcp_remove_connections,
 		tcp_remove_connections_acceptor_wakeup,
 		tcp_limiter_penalty,
+		tcp_limiter_set_transport_options,
 		tcp_set_max_connections,
 		tcp_set_max_connections_clean,
 		tcp_getopts_capability,
@@ -1552,6 +1554,56 @@ tcp_limiter_penalty(Config) ->
 	receive {allow, [_Socket5], {close_connections_for, _}} -> ok after 100 -> error(timeout) end,
 	receive {retired, [_]} -> ok after 100 -> error(timeout) end,
 	receive {retired, [_]} -> ok after 100 -> error(timeout) end,
+	ok = ranch:stop_listener(Name).
+
+tcp_limiter_set_transport_options(Config) ->
+	doc("Ensure that limiter can be updated in `set_transport_options/2`."),
+	Name = name(),
+	SockOpts = config(socket_opts, Config),
+	Limiter1 = {counting_limiter, #{
+		every => 2,
+		penalty => close_connection,
+		report_to => self()}},
+	Limiter2 = {counting_limiter, #{
+		every => 1000,
+		penalty => {close_connections_for, 1000},
+		report_to => self()}},
+	{ok, _} = ranch:start_listener(Name,
+		ranch_tcp, #{num_acceptors => 1, limiter => Limiter1, socket_opts => SockOpts},
+		echo_protocol, []),
+	Port = ranch:get_port(Name),
+	ConnectOptions = [binary, {active, false}],
+	Localhost = "localhost",
+	%% Every other connection is disallowed initially:
+	{ok, Socket1} = gen_tcp:connect(Localhost, Port, ConnectOptions),
+	{error, timeout} = gen_tcp:recv(Socket1, 0, 100),
+	{ok, Socket2} = gen_tcp:connect(Localhost, Port, ConnectOptions),
+	{error, closed} = gen_tcp:recv(Socket2, 0, 100),
+	{ok, Socket3} = gen_tcp:connect(Localhost, Port, ConnectOptions),
+	{error, timeout} = gen_tcp:recv(Socket3, 0, 100),
+	{ok, Socket4} = gen_tcp:connect(Localhost, Port, ConnectOptions),
+	{error, closed} = gen_tcp:recv(Socket4, 0, 100),
+	%% Set more lax limiter:
+	ok = ranch:set_transport_options(Name,
+		#{num_acceptors => 1, limiter => Limiter2, socket_opts => SockOpts}),
+	%% Connections are free to ho now:
+	{ok, Socket5} = gen_tcp:connect(Localhost, Port, ConnectOptions),
+	{error, timeout} = gen_tcp:recv(Socket5, 0, 100),
+	{ok, Socket6} = gen_tcp:connect(Localhost, Port, ConnectOptions),
+	{error, timeout} = gen_tcp:recv(Socket6, 0, 100),
+	%% Verify limiter was notified of existing connection after update:
+	receive {allow, [_Socket1], ok} -> ok after 100 -> error(timeout) end,
+	Pid1 = receive {accepted, [P1]} -> P1 after 100 -> error(timeout) end,
+	receive {allow, [_Socket2], close_connection} -> ok after 100 -> error(timeout) end,
+	receive {allow, [_Socket3], ok} -> ok after 100 -> error(timeout) end,
+	Pid2 = receive {accepted, [P2]} -> P2 after 100 -> error(timeout) end,
+	receive {allow, [_Socket4], close_connection} -> ok after 100 -> error(timeout) end,
+	receive {accepted, [Pid1]} -> ok after 100 -> error(timeout) end,
+	receive {accepted, [Pid2]} -> ok after 100 -> error(timeout) end,
+	receive {allow, [_Socket5], ok} -> ok after 100 -> error(timeout) end,
+	receive {accepted, [_Pid3]} -> ok after 100 -> error(timeout) end,
+	receive {allow, [_Socket6], ok} -> ok after 100 -> error(timeout) end,
+	receive {accepted, [_Pid4]} -> ok after 100 -> error(timeout) end,
 	ok = ranch:stop_listener(Name).
 
 tcp_set_max_connections(Config) ->
