@@ -8,12 +8,12 @@
 create(Options) ->
 	Options#{n => 0}.
 
-allow(Socket, State0 = #{n := N0, every := Every, penalty := Penalty}) ->
+allow(Socket, State0 = #{n := N0, penalize := Pred, penalty := Penalty}) ->
 	N = N0 + 1,
 	State = State0#{n := N},
-	Ret = case N rem Every of
-		0 -> Penalty;
-		_ -> ok
+	Ret = case Pred(N) of
+		true -> Penalty;
+		false -> ok
 	end,
 	report(?FUNCTION_NAME, [Socket], Ret, State),
 	{Ret, State}.

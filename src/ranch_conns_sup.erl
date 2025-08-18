@@ -147,7 +147,7 @@ loop(State=#state{parent=Parent, ref=Ref, id=Id, conn_type=ConnType,
 					handshake(State, CurConns, NbChildren, Limiter2, Sleepers,
 						To, Socket, SupPid, ProtocolPid);
 				false ->
-					penalize(State, LimitRet, Socket, To),
+					_ = penalize(State, LimitRet, Socket, To),
 					loop(State, CurConns, NbChildren, Limiter1, Sleepers);
 				Ret ->
 					To ! self(),

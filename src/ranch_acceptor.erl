@@ -30,7 +30,9 @@ init(LSocket, Transport, Logger, ConnsSup) ->
 	MonitorRef = monitor(process, ConnsSup),
 	loop(LSocket, Transport, Logger, ConnsSup, MonitorRef).
 
--spec loop(inet:socket(), module(), module(), pid(), reference()) -> no_return().
+-spec loop(Socket, module(), module(), pid(), reference()) -> no_return() when
+	Socket :: inet:socket()
+			| _Penalized :: {close_until, _TimestampMs :: integer(), inet:socket()}.
 loop(LSocket0, Transport, Logger, ConnsSup, MonitorRef) ->
 	Ret = case accept(LSocket0, Transport, infinity) of
 		{ok, CSocket} ->
@@ -87,8 +89,10 @@ accept(LSocket, Transport, Timeout) ->
 
 penalize({close_connections_for, Milliseconds}, LSocket) ->
 	Deadline = erlang:monotonic_time(millisecond) + Milliseconds,
-	{close_until, Deadline, LSocket}.
+	{close_until, Deadline, depenalize(LSocket)}.
 
+-spec depenalize(inet:socket() | {close_until, integer(), inet:socket()}) ->
+	inet:socket().
 depenalize({close_until, _, LSocket}) ->
 	LSocket;
 depenalize(LSocket) ->
