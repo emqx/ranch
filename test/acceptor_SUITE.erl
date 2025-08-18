@@ -1517,8 +1517,17 @@ tcp_limiter_penalty(Config) ->
 	doc("Ensure that acceptor reacts to connection limiter."),
 	Name = name(),
 	SockOpts = config(socket_opts, Config),
-	Limiter = {counting_limiter,
-		#{every => 2, penalty => {close_connections_for, 1000}, report_to => self()}},
+	Limiter = {counting_limiter, #{
+		penalize => fun
+			(1) -> false;
+			(2) -> true;
+			(3) -> false;
+			(4) -> true;
+			(5) -> true;
+			(_) -> false
+		end,
+		penalty => {close_connections_for, 1000},
+		report_to => self()}},
 	{ok, _} = ranch:start_listener(Name,
 		ranch_tcp, #{num_acceptors => 1, limiter => Limiter, socket_opts => SockOpts},
 		echo_protocol, []),
@@ -1543,6 +1552,10 @@ tcp_limiter_penalty(Config) ->
 	{error, closed} = gen_tcp:recv(Socket5, 0, 100),
 	{ok, Socket6} = gen_tcp:connect(Localhost, Port, ConnectOptions),
 	{error, closed} = gen_tcp:recv(Socket6, 0, 100),
+	%% ...And fifth connection:
+	receive after 1000 -> ok end,
+	{ok, Socket7} = gen_tcp:connect(Localhost, Port, ConnectOptions),
+	{error, closed} = gen_tcp:recv(Socket7, 0, 100),
 	ok = gen_tcp:close(Socket1),
 	ok = gen_tcp:close(Socket4),
 	%% Verify limiter was notified of connection and process events:
@@ -1552,6 +1565,7 @@ tcp_limiter_penalty(Config) ->
 	receive {allow, [_Socket4], ok} -> ok after 100 -> error(timeout) end,
 	receive {accepted, [_Pid4]} -> ok after 100 -> error(timeout) end,
 	receive {allow, [_Socket5], {close_connections_for, _}} -> ok after 100 -> error(timeout) end,
+	receive {allow, [_Socket7], {close_connections_for, _}} -> ok after 100 -> error(timeout) end,
 	receive {retired, [_]} -> ok after 100 -> error(timeout) end,
 	receive {retired, [_]} -> ok after 100 -> error(timeout) end,
 	ok = ranch:stop_listener(Name).
@@ -1561,11 +1575,11 @@ tcp_limiter_set_transport_options(Config) ->
 	Name = name(),
 	SockOpts = config(socket_opts, Config),
 	Limiter1 = {counting_limiter, #{
-		every => 2,
+		penalize => fun (N) -> 0 =:= N rem 2 end,
 		penalty => close_connection,
 		report_to => self()}},
 	Limiter2 = {counting_limiter, #{
-		every => 1000,
+		penalize => fun (N) -> 0 =:= N rem 1000 end,
 		penalty => {close_connections_for, 1000},
 		report_to => self()}},
 	{ok, _} = ranch:start_listener(Name,
