@@ -1575,10 +1575,12 @@ tcp_limiter_set_transport_options(Config) ->
 	Name = name(),
 	SockOpts = config(socket_opts, Config),
 	Limiter1 = {counting_limiter, #{
+		name => l1,
 		penalize => fun (N) -> 0 =:= N rem 2 end,
 		penalty => close_connection,
 		report_to => self()}},
 	Limiter2 = {counting_limiter, #{
+		name => l2,
 		penalize => fun (N) -> 0 =:= N rem 1000 end,
 		penalty => {close_connections_for, 1000},
 		report_to => self()}},
@@ -1605,6 +1607,13 @@ tcp_limiter_set_transport_options(Config) ->
 	{error, timeout} = gen_tcp:recv(Socket5, 0, 100),
 	{ok, Socket6} = gen_tcp:connect(Localhost, Port, ConnectOptions),
 	{error, timeout} = gen_tcp:recv(Socket6, 0, 100),
+	%% Set options without chaning the limiter:
+	ok = ranch:set_transport_options(Name,
+		#{num_acceptors => 1, limiter => Limiter2, socket_opts => SockOpts}),
+	%% Verify limiter was created exactly 2 times:
+	receive {create, [_Opts1 = #{name := l1}]} -> ok after 100 -> error(timeout) end,
+	receive {create, [_Opts2 = #{name := l2}]} -> ok after 100 -> error(timeout) end,
+	receive {create, [_Opts3]} -> error(unexpected) after 100 -> ok end,
 	%% Verify limiter was notified of existing connection after update:
 	receive {allow, [_Socket1], ok} -> ok after 100 -> error(timeout) end,
 	Pid1 = receive {accepted, [P1]} -> P1 after 100 -> error(timeout) end,

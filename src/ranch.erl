@@ -434,16 +434,12 @@ set_transport_options(Ref, TransOpts0) ->
 	TransOpts = normalize_opts(TransOpts0),
 	case validate_transport_opts(TransOpts) of
 		ok ->
+			TransOptsBefore = ranch_server:get_transport_options(Ref),
 			ok = ranch_server:set_transport_options(Ref, TransOpts),
-			ok = apply_transport_options(Ref, TransOpts);
+			ok = ranch_conns_sup_sup:apply_transport_options(Ref, TransOpts, TransOptsBefore);
 		TransOptsError ->
 			TransOptsError
 	end.
-
-apply_transport_options(Ref, TransOpts) ->
-	_ = [ConnsSup ! {set_transport_options, TransOpts}
-		|| {_, ConnsSup} <- ranch_server:get_connections_sups(Ref)],
-	ok.
 
 -spec get_protocol_options(ref()) -> any().
 get_protocol_options(Ref) ->
