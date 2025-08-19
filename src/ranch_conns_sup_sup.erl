@@ -19,6 +19,8 @@
 -export([start_link/4]).
 -export([init/1]).
 
+-export([apply_transport_options/3]).
+
 -spec start_link(ranch:ref(), module(), module(), module()) -> {ok, pid()}.
 start_link(Ref, Transport, Protocol, Logger) ->
 	ok = ranch_server:cleanup_connections_sups(Ref),
@@ -32,11 +34,33 @@ init({Ref, Transport, Protocol, Logger}) ->
 	TransOpts = ranch_server:get_transport_options(Ref),
 	NumAcceptors = maps:get(num_acceptors, TransOpts, 10),
 	NumConnsSups = maps:get(num_conns_sups, TransOpts, NumAcceptors),
+	Limiter = create_limiter(maps:get(limiter, TransOpts, undefined)),
 	StatsCounters = counters:new(2*NumConnsSups, []),
 	ok = ranch_server:set_stats_counters(Ref, StatsCounters),
 	ChildSpecs = [#{
 		id => {ranch_conns_sup, N},
-		start => {ranch_conns_sup, start_link, [Ref, N, Transport, TransOpts, Protocol, Logger]},
+		start => {ranch_conns_sup, start_link,
+			[Ref, N, Transport, TransOpts, Protocol, Logger, Limiter]},
 		type => supervisor
 	} || N <- lists:seq(1, NumConnsSups)],
 	{ok, {#{intensity => 1 + ceil(math:log2(NumConnsSups))}, ChildSpecs}}.
+
+-spec apply_transport_options(ranch:ref(), ranch:opts(), _Before :: ranch:opts()) ->
+	ok.
+apply_transport_options(Ref, TransOpts, TransOptsBefore) ->
+	ConnSups = ranch_server:get_connections_sups(Ref),
+	_ = [ConnsSup ! {set_transport_options, TransOpts} || {_, ConnsSup} <- ConnSups],
+	LimiterOpts = maps:get(limiter, TransOpts, undefined),
+	case maps:get(limiter, TransOptsBefore, undefined) of
+		LimiterOpts -> ok;
+		_Different ->
+			%% Limiter needs to be re-initialized / turned off.
+			Limiter = create_limiter(LimiterOpts),
+			_ = [ConnsSup ! {set_limiter, Limiter} || {_, ConnsSup} <- ConnSups],
+			ok
+	end.
+
+create_limiter(undefined) ->
+	undefined;
+create_limiter({Module, Options}) ->
+	ranch_conns_limiter:create(Module, Options).

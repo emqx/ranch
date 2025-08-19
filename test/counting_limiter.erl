@@ -6,7 +6,9 @@
 -export([accepted/2, retired/2]).
 
 create(Options) ->
-	Options#{n => 0}.
+	State = Options#{n => 0},
+	report(?FUNCTION_NAME, [Options], State),
+	State.
 
 allow(Socket, State0 = #{n := N0, penalize := Pred, penalty := Penalty}) ->
 	N = N0 + 1,

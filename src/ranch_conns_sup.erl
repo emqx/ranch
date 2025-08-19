@@ -19,12 +19,12 @@
 -module(ranch_conns_sup).
 
 %% API.
--export([start_link/6]).
+-export([start_link/7]).
 -export([start_protocol/3]).
 -export([active_connections/1]).
 
 %% Supervisor internals.
--export([init/7]).
+-export([init/8]).
 -export([system_continue/3]).
 -export([system_terminate/4]).
 -export([system_code_change/4]).
@@ -43,7 +43,6 @@
 	opts :: any(),
 	handshake_timeout :: timeout(),
 	max_conns = undefined :: ranch:max_conns(),
-	limiter_opts = undefined :: {module(), _Options} | undefined,
 	stats_counters_ref :: counters:counters_ref(),
 	alarms = #{} :: #{term() => {map(), undefined | reference()}},
 	logger = undefined :: module()
@@ -51,10 +50,12 @@
 
 %% API.
 
--spec start_link(ranch:ref(), pos_integer(), module(), any(), module(), module()) -> {ok, pid()}.
-start_link(Ref, Id, Transport, TransOpts, Protocol, Logger) ->
+-spec start_link(ranch:ref(), pos_integer(), module(), any(), module(), module(),
+		ranch_conns_limiter:limiter() | undefined) ->
+	{ok, pid()}.
+start_link(Ref, Id, Transport, TransOpts, Protocol, Logger, Limiter) ->
 	proc_lib:start_link(?MODULE, init,
-		[self(), Ref, Id, Transport, TransOpts, Protocol, Logger]).
+		[self(), Ref, Id, Transport, TransOpts, Protocol, Logger, Limiter]).
 
 %% We can safely assume we are on the same node as the supervisor.
 %%
@@ -106,8 +107,10 @@ active_connections(SupPid) ->
 
 %% Supervisor internals.
 
--spec init(pid(), ranch:ref(), pos_integer(), module(), any(), module(), module()) -> no_return().
-init(Parent, Ref, Id, Transport, TransOpts, Protocol, Logger) ->
+-spec init(pid(), ranch:ref(), pos_integer(), module(), any(), module(), module(),
+		ranch_conns_limiter:limiter() | undefined) ->
+	no_return().
+init(Parent, Ref, Id, Transport, TransOpts, Protocol, Logger, Limiter) ->
 	process_flag(trap_exit, true),
 	ok = ranch_server:set_connections_sup(Ref, Id, self()),
 	MaxConns = ranch_server:get_max_connections(Ref),
@@ -115,8 +118,6 @@ init(Parent, Ref, Id, Transport, TransOpts, Protocol, Logger) ->
 	ConnType = maps:get(connection_type, TransOpts, worker),
 	Shutdown = maps:get(shutdown, TransOpts, 5000),
 	HandshakeTimeout = maps:get(handshake_timeout, TransOpts, 5000),
-	LimiterOpts = maps:get(limiter, TransOpts, undefined),
-	Limiter = limiter_init(LimiterOpts),
 	ProtoOpts = ranch_server:get_protocol_options(Ref),
 	StatsCounters = ranch_server:get_stats_counters(Ref),
 	ok = proc_lib:init_ack(Parent, {ok, self()}),
@@ -125,7 +126,6 @@ init(Parent, Ref, Id, Transport, TransOpts, Protocol, Logger) ->
 		opts=ProtoOpts, stats_counters_ref=StatsCounters,
 		handshake_timeout=HandshakeTimeout,
 		max_conns=MaxConns, alarms=Alarms,
-		limiter_opts=LimiterOpts,
 		logger=Logger}, 0, 0, Limiter, []).
 
 loop(State=#state{parent=Parent, ref=Ref, id=Id, conn_type=ConnType,
@@ -196,6 +196,10 @@ loop(State=#state{parent=Parent, ref=Ref, id=Id, conn_type=ConnType,
 		%% Upgrade the transport options.
 		{set_transport_options, TransOpts} ->
 			set_transport_options(State, CurConns, NbChildren, Limiter, Sleepers, TransOpts);
+		%% Upgrade the limiter.
+		{set_limiter, Limiter1} ->
+			Limiter2 = limiter_restart(Limiter1),
+			loop(State, CurConns, NbChildren, Limiter2, Sleepers);
 		%% Upgrade the protocol options.
 		{set_protocol_options, Opts2} ->
 			loop(State#state{opts=Opts2},
@@ -300,15 +304,9 @@ handshake(State=#state{ref=Ref, transport=Transport, handshake_timeout=Handshake
 			loop(State, CurConns, NbChildren, Limiter, Sleepers)
 	end.
 
-limiter_init(undefined) ->
+limiter_restart(undefined) ->
 	undefined;
-limiter_init({Module, Options}) ->
-	ranch_conns_limiter:create(Module, Options).
-
-limiter_reinit(undefined) ->
-	undefined;
-limiter_reinit(ModOpts) ->
-	Limiter = limiter_init(ModOpts),
+limiter_restart(Limiter) ->
 	lists:foldl(
 		fun ({Pid, Type}, LimiterAcc) when Type =:= active orelse Type =:= removed ->
 				limiter_accepted(Pid, LimiterAcc);
@@ -383,18 +381,11 @@ get_alarms(#{alarms := Alarms}) when is_map(Alarms) ->
 get_alarms(_) ->
 	#{}.
 
-set_transport_options(State=#state{max_conns=MaxConns0, limiter_opts=LimiterOpts0},
+set_transport_options(State=#state{max_conns=MaxConns0},
 		CurConns, NbChildren, Limiter, Sleepers0, TransOpts) ->
 	MaxConns1 = maps:get(max_connections, TransOpts, 1024),
 	HandshakeTimeout = maps:get(handshake_timeout, TransOpts, 5000),
 	Shutdown = maps:get(shutdown, TransOpts, 5000),
-	Limiter1 = case maps:get(limiter, TransOpts, undefined) of
-			LimiterOpts0 ->
-				Limiter;
-			LimiterOpts ->
-				%% Limiter needs to be re-initialized.
-				limiter_reinit(LimiterOpts)
-		end,
 	Sleepers1 = case MaxConns1 > MaxConns0 of
 		true ->
 			_ = [To ! self() || To <- Sleepers0],
@@ -404,7 +395,7 @@ set_transport_options(State=#state{max_conns=MaxConns0, limiter_opts=LimiterOpts
 	end,
 	State1=set_alarm_option(State, TransOpts, CurConns),
 	loop(State1#state{max_conns=MaxConns1, handshake_timeout=HandshakeTimeout, shutdown=Shutdown},
-		CurConns, NbChildren, Limiter1, Sleepers1).
+		CurConns, NbChildren, Limiter, Sleepers1).
 
 set_alarm_option(State=#state{ref=Ref, alarms=OldAlarms}, TransOpts, CurConns) ->
 	NewAlarms0 = get_alarms(TransOpts),
