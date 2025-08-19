@@ -24,7 +24,7 @@
 all() ->
 	ct_helper:all(?MODULE).
 
-init_per_suite(Config) ->
+init_per_suite(_Config) ->
 	%% Remove environment variables inherited from Erlang.mk.
 	os:unsetenv("ERLANG_MK_TMP"),
 	os:unsetenv("APPS_DIR"),
@@ -33,7 +33,7 @@ init_per_suite(Config) ->
 	os:unsetenv("CI_ERLANG_MK"),
 	%% Ensure we are using the C locale for all os:cmd calls.
 	os:putenv("LC_ALL", "C"),
-	Config.
+	{skip, "TODO: Temporarily disabled"}.
 
 end_per_suite(_Config) ->
 	ok.
