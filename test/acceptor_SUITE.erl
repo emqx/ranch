@@ -91,6 +91,8 @@ groups() ->
 		ssl_graceful,
 		ssl_handshake,
 		ssl_handshake_error,
+		ssl_limiter_close_connection_no_leak,
+		ssl_limiter_close_connections_for_no_leak,
 		ssl_sni_echo,
 		ssl_sni_fail,
 		ssl_tls_psk,
@@ -926,6 +928,56 @@ ssl_handshake_error(_) ->
 	%% Make sure the listener stopped.
 	{'EXIT', _} = begin catch ranch:get_port(Name) end,
 	ok.
+
+ssl_limiter_close_connection_no_leak(_) ->
+	doc("Ensure that SSL sockets refused by the connection limiter "
+		"before the handshake are closed and do not leak TLS processes."),
+	do_ssl_limiter_no_leak(name(), close_connection).
+
+ssl_limiter_close_connections_for_no_leak(_) ->
+	doc("Ensure that SSL sockets refused by the connection limiter "
+		"or by the penalized acceptor before the handshake are closed "
+		"and do not leak TLS processes."),
+	do_ssl_limiter_no_leak(name(), {close_connections_for, 60000}).
+
+do_ssl_limiter_no_leak(Name, Penalty) ->
+	Opts = ct_helper:get_certs_from_ets(),
+	Limiter = {counting_limiter,
+		#{penalize => fun(_) -> true end, penalty => Penalty, report_to => self()}},
+	{ok, _} = ranch:start_listener(Name,
+		ranch_ssl, #{num_acceptors => 1, limiter => Limiter, socket_opts => Opts},
+		echo_protocol, []),
+	Port = ranch:get_port(Name),
+	Baseline = count_tls_connections(),
+	Sockets = [begin
+		{ok, Socket} = gen_tcp:connect("localhost", Port,
+			[binary, {active, false}, {packet, raw}]),
+		Socket
+	end || _ <- lists:seq(1, 5)],
+	%% The server closes each refused socket, possibly after a TLS alert.
+	[ok = wait_closed(Socket) || Socket <- Sockets],
+	ok = wait_tls_connections(Baseline, 20),
+	ok = ranch:stop_listener(Name).
+
+wait_closed(Socket) ->
+	case gen_tcp:recv(Socket, 0, 1000) of
+		{ok, _Alert} -> wait_closed(Socket);
+		{error, closed} -> ok
+	end.
+
+count_tls_connections() ->
+	proplists:get_value(active, supervisor:count_children(tls_connection_sup)).
+
+wait_tls_connections(Expected, 0) ->
+	{error, {tls_connections, Expected, count_tls_connections()}};
+wait_tls_connections(Expected, Retries) ->
+	case count_tls_connections() of
+		Expected ->
+			ok;
+		_ ->
+			receive after 100 -> ok end,
+			wait_tls_connections(Expected, Retries - 1)
+	end.
 
 ssl_local_echo(_) ->
 	case do_os_supports_local_sockets() of
