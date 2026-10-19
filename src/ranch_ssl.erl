@@ -323,7 +323,15 @@ shutdown(Socket, How) ->
 
 -spec close(ssl:sslsocket()) -> ok.
 close(Socket) ->
-	ssl:close(Socket).
+	case ssl:close(Socket) of
+		%% Before the TLS handshake starts, the connection process refuses
+		%% to close. It stops when its controlling process goes down.
+		{error, notsup_on_transport_accept_socket} ->
+			_ = ssl:controlling_process(Socket, spawn(fun() -> ok end)),
+			ok;
+		Ret ->
+			Ret
+	end.
 
 -spec cleanup(ranch:transport_opts(opts())) -> ok.
 cleanup(#{socket_opts:=SocketOpts}) ->
