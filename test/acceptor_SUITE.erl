@@ -117,6 +117,8 @@ groups() ->
 		misc_post_listen_callback,
 		misc_post_listen_callback_error,
 		misc_set_transport_options,
+		misc_set_transport_options_max_connections_running,
+		misc_set_transport_options_max_connections_suspended,
 		misc_wait_for_connections,
 		misc_multiple_ip_local_socket_opts,
 		misc_connection_alarms,
@@ -498,6 +500,43 @@ misc_set_transport_options(_) ->
 	LSocket = do_get_listener_socket(ListenerSupPid),
 	{ok, [{send_timeout, 5002}]} = ranch_tcp:getopts(LSocket, [send_timeout]),
 	ok = ranch:stop_listener(Name).
+
+misc_set_transport_options_max_connections_running(_) ->
+	doc("Ensure transport option updates report the connection limit for a running listener."),
+	Name = name(),
+	TransOpts = #{num_acceptors => 1},
+	{ok, _} = ranch:start_listener(Name, ranch_tcp,
+		TransOpts#{max_connections => infinity}, echo_protocol, []),
+	ok = do_set_transport_options_max_connections(Name, TransOpts),
+	ok = ranch:stop_listener(Name).
+
+misc_set_transport_options_max_connections_suspended(_) ->
+	doc("Ensure transport option updates report the connection limit for a suspended listener."),
+	Name = name(),
+	TransOpts = #{num_acceptors => 1},
+	{ok, _} = ranch:start_listener(Name, ranch_tcp,
+		TransOpts#{max_connections => infinity}, echo_protocol, []),
+	ok = ranch:suspend_listener(Name),
+	ok = do_set_transport_options_max_connections(Name, TransOpts),
+	ok = ranch:resume_listener(Name),
+	ok = ranch:stop_listener(Name).
+
+do_set_transport_options_max_connections(Name, TransOpts) ->
+	lists:foreach(
+		fun({Opts, MaxConns}) ->
+			ok = ranch:set_transport_options(Name, Opts),
+			MaxConns = ranch:get_max_connections(Name),
+			#{max_connections := MaxConns, transport_options := Opts} = ranch:info(Name),
+			#{Name := #{max_connections := MaxConns}} = ranch:info()
+		end,
+		[
+			{TransOpts#{max_connections => infinity}, infinity},
+			{TransOpts#{max_connections => 10}, 10},
+			{TransOpts#{max_connections => 20}, 20},
+			{TransOpts#{max_connections => infinity}, infinity},
+			{TransOpts, 1024}
+		]
+	).
 
 misc_wait_for_connections(_) ->
 	doc("Ensure wait for connections works."),

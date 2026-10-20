@@ -214,7 +214,8 @@ handle_call({set_stats_counters, Ref, Counters}, _, State) ->
 	ets:insert(?TAB, {{stats_counters, Ref}, Counters}),
 	{reply, ok, State};
 handle_call({set_trans_opts, Ref, Opts}, _, State) ->
-	ets:insert(?TAB, {{trans_opts, Ref}, Opts}),
+	MaxConns = maps:get(max_connections, Opts, 1024),
+	ets:insert(?TAB, [{{trans_opts, Ref}, Opts}, {{max_conns, Ref}, MaxConns}]),
 	{reply, ok, State};
 handle_call({set_proto_opts, Ref, Opts}, _, State) ->
 	ets:insert(?TAB, {{proto_opts, Ref}, Opts}),
