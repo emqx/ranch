@@ -18,6 +18,8 @@
 %% the currently open connections.
 -module(ranch_conns_sup).
 
+-include("ranch.hrl").
+
 %% API.
 -export([start_link/7]).
 -export([start_protocol/3]).
@@ -387,7 +389,7 @@ get_alarms(_) ->
 
 set_transport_options(State=#state{max_conns=MaxConns0},
 		CurConns, NbChildren, Limiter, Sleepers0, TransOpts) ->
-	MaxConns1 = maps:get(max_connections, TransOpts, 1024),
+	MaxConns1 = maps:get(max_connections, TransOpts, ?DEFAULT_MAX_CONNECTIONS),
 	HandshakeTimeout = maps:get(handshake_timeout, TransOpts, 5000),
 	Shutdown = maps:get(shutdown, TransOpts, 5000),
 	Sleepers1 = case MaxConns1 > MaxConns0 of

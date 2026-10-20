@@ -15,13 +15,15 @@
 -module(ranch_listener_sup).
 -behaviour(supervisor).
 
+-include("ranch.hrl").
+
 -export([start_link/5]).
 -export([init/1]).
 
 -spec start_link(ranch:ref(), module(), any(), module(), any())
 	-> {ok, pid()}.
 start_link(Ref, Transport, TransOpts, Protocol, ProtoOpts) ->
-	MaxConns = maps:get(max_connections, TransOpts, 1024),
+	MaxConns = maps:get(max_connections, TransOpts, ?DEFAULT_MAX_CONNECTIONS),
 	Logger = maps:get(logger, TransOpts, logger),
 	ranch_server:set_new_listener_opts(Ref, MaxConns, TransOpts, ProtoOpts,
 		[Ref, Transport, TransOpts, Protocol, ProtoOpts]),
