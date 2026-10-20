@@ -16,6 +16,8 @@
 -module(ranch_server).
 -behaviour(gen_server).
 
+-include("ranch.hrl").
+
 %% API.
 -export([start_link/0]).
 -export([set_new_listener_opts/5]).
@@ -214,7 +216,7 @@ handle_call({set_stats_counters, Ref, Counters}, _, State) ->
 	ets:insert(?TAB, {{stats_counters, Ref}, Counters}),
 	{reply, ok, State};
 handle_call({set_trans_opts, Ref, Opts}, _, State) ->
-	MaxConns = maps:get(max_connections, Opts, 1024),
+	MaxConns = maps:get(max_connections, Opts, ?DEFAULT_MAX_CONNECTIONS),
 	ets:insert(?TAB, [{{trans_opts, Ref}, Opts}, {{max_conns, Ref}, MaxConns}]),
 	{reply, ok, State};
 handle_call({set_proto_opts, Ref, Opts}, _, State) ->
